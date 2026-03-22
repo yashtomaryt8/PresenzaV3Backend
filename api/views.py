@@ -3,6 +3,7 @@ import numpy as np
 import base64
 import csv
 import io
+import os
 from datetime import date, timedelta, datetime
 from collections import defaultdict
 
@@ -17,7 +18,7 @@ from rest_framework import status
 
 from .models import UserProfile, AttendanceLog, AttendanceSession
 from .serializers import UserSerializer, AttendanceLogSerializer, AttendanceSessionSerializer
-from .face_utils import get_embedding, process_frame
+from .face_utils import get_embedding, process_frame, check_duplicate_face
 from .ai_utils import query_groq, query_ollama, build_analytics_prompt
 
 
@@ -47,27 +48,59 @@ class RegisterUser(APIView):
         if not images:
             return Response({'error': 'At least one image is required.'}, status=400)
 
-        user = None
+        # ── Determine if creating new or updating existing ──────────────────
+        existing_user = None
         if student_id:
-            user = UserProfile.objects.filter(student_id=student_id).first()
-        if user is None:
-            user = UserProfile(name=name, student_id=student_id, department=department)
+            existing_user = UserProfile.objects.filter(student_id=student_id).first()
 
-        added, failed = 0, 0
+        # ── Extract embeddings from all uploaded images ─────────────────────
+        embeddings = []
+        failed = 0
         for img in images:
-            emb = get_embedding(img)  # calls HF Space
+            emb = get_embedding(img)
             if emb is not None:
-                user.add_embedding(emb)
-                added += 1
+                embeddings.append(emb)
             else:
                 failed += 1
 
-        if added == 0:
-            return Response({'error': 'No faces detected in any image. Is HF Space running?'}, status=400)
+        if not embeddings:
+            return Response(
+                {'error': 'No faces detected in any image. Is HF Space running?'},
+                status=400
+            )
+
+        # ── Duplicate face check (only for NEW registrations) ──────────────
+        # If student_id matches an existing user, we're updating — skip check.
+        # If no existing user found, verify no one else in the DB looks like this face.
+        if existing_user is None:
+            for emb in embeddings:
+                dup_user, dup_score = check_duplicate_face(emb)
+                if dup_user is not None:
+                    return Response({
+                        'error': (
+                            f"This face appears to already be registered as "
+                            f"'{dup_user.name}' (ID: {dup_user.student_id or 'no ID'}). "
+                            f"Similarity: {round(dup_score * 100, 1)}%. "
+                            f"If this is a different person, ensure photos are clear and front-facing."
+                        ),
+                        'duplicate': {
+                            'name':       dup_user.name,
+                            'student_id': dup_user.student_id,
+                            'confidence': round(dup_score * 100, 1),
+                        }
+                    }, status=409)   # HTTP 409 Conflict
+
+        # ── Build or update user ────────────────────────────────────────────
+        user = existing_user or UserProfile(
+            name=name, student_id=student_id, department=department
+        )
+
+        for emb in embeddings:
+            user.add_embedding(emb)
 
         user.save()
         return Response({
-            'message':     f"Registered '{name}' with {added} photo(s).",
+            'message':     f"Registered '{name}' with {len(embeddings)} photo(s).",
             'failed':      failed,
             'photo_count': user.photo_count,
             'user_id':     user.id,
@@ -129,7 +162,6 @@ class ScanFrame(APIView):
         if event_type not in ('entry', 'exit'):
             event_type = 'entry'
 
-        # process_frame calls HF Space for detection, does matching locally
         _, detections = process_frame(img, event_type)
 
         return Response({
@@ -289,21 +321,21 @@ class AIInsightView(APIView):
         ).values('user').distinct().count()
 
         stats = {
-            'total_users':          total,
-            'present_today':        present,
+            'total_users':           total,
+            'present_today':         present,
             'attendance_rate_today': round(present / total * 100, 1) if total else 0,
-            'late_today':           AttendanceLog.objects.filter(
-                                        timestamp__date=today,
-                                        event_type='entry',
-                                        timestamp__hour__gte=9
-                                    ).values('user').distinct().count(),
-            'week_total':           AttendanceLog.objects.filter(
-                                        timestamp__date__gte=today - timedelta(days=6),
-                                        event_type='entry'
-                                    ).count(),
-            'week_avg':             0,
-            'top_attendee':         'N/A',
-            'peak_hour':            'unknown',
+            'late_today':            AttendanceLog.objects.filter(
+                                         timestamp__date=today,
+                                         event_type='entry',
+                                         timestamp__hour__gte=9
+                                     ).values('user').distinct().count(),
+            'week_total':            AttendanceLog.objects.filter(
+                                         timestamp__date__gte=today - timedelta(days=6),
+                                         event_type='entry'
+                                     ).count(),
+            'week_avg':              0,
+            'top_attendee':          'N/A',
+            'peak_hour':             'unknown',
         }
 
         top = (AttendanceLog.objects.filter(event_type='entry')
@@ -346,5 +378,3 @@ class HealthCheck(APIView):
             'users':  UserProfile.objects.count(),
             'hf_space': hf_url,
         })
-
-import os
