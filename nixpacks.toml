@@ -9,4 +9,7 @@ cmds = [
 ]
 
 [start]
-cmd = "python manage.py migrate && gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --timeout 120"
+# 2 workers × 8 threads = 16 concurrent slots — enough for many devices scanning simultaneously
+# gthread worker class allows threads to handle concurrent requests per worker
+# timeout 60 kills stuck workers fast instead of holding sockets for 2 minutes
+cmd = "python manage.py collectstatic --noinput && python manage.py migrate && gunicorn backend.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --threads 8 --worker-class gthread --timeout 60 --keep-alive 5 --graceful-timeout 30"
