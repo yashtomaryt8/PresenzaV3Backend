@@ -52,6 +52,22 @@ Three-layer fix:
   2. _hf_post()       — wrapper with one retry on timeout.
   3. HF_TIMEOUT=30s   — generous enough to survive a warm Space under load.
 """
+"""
+face_utils.py
+─────────────────────────────────────────────────────────────────────────────
+PING / KEEP-ALIVE FIXES:
+  - PING_TIMEOUT = 60s  (was 10s — buffalo_l cold start takes 30-60s)
+  - Wake-up mode: on ping failure, switches to 30s retry interval
+    and keeps retrying until Space responds, then returns to 4-min cadence
+  - Only one worker runs the thread (enforced by apps.py file-lock)
+
+RECOGNITION:
+  - buffalo_l (ResNet50 ArcFace) → 88-95% confidence
+  - Centroid matching vs per-embedding max
+  - Per-event-type cooldowns (fixes shaky exit)
+  - Duplicate registration check (409 Conflict)
+  - entry_count for "2nd entry today" display
+"""
 
 import os
 import time
@@ -75,57 +91,108 @@ RECOGNITION_THRESHOLD   = 0.50
 DUPLICATE_REG_THRESHOLD = 0.55
 ENTRY_COOLDOWN_S        = 10
 EXIT_COOLDOWN_S         = 5
-HF_TIMEOUT              = 30    # was 15 — raised to survive cold-start tail
-PING_INTERVAL_S         = 4 * 60  # 4 min; HF sleeps after ~15 min idle
+
+# ── Timeout constants ─────────────────────────────────────────────────────────
+# HF_TIMEOUT: per-request timeout for /extract and /detect
+# Use 30s — generous for a WARM Space under load.
+HF_TIMEOUT = 30
+
+# PING_TIMEOUT: timeout for keep-alive /health pings.
+# Must be >= cold-start time. buffalo_l cold start = 30-60s.
+# We set 60s here so a single ping can survive a full cold start.
+PING_TIMEOUT = 60
+
+# Keep-alive cadence when Space is healthy
+PING_INTERVAL_NORMAL_S = 4 * 60   # 4 minutes
+
+# Keep-alive cadence when Space is not responding (wake-up mode)
+PING_INTERVAL_WAKEUP_S = 30       # retry every 30s until it responds
 
 
 # ── Keep-alive pinger ─────────────────────────────────────────────────────────
 def _hf_ping_loop():
     """
-    Daemon thread: pings HF Space /health every 4 minutes.
-    Keeps the Space warm so it never times out during actual use.
-    Started from apps.py AppConfig.ready() — once per process.
+    Pings /health every 4 minutes to keep the Space warm.
+
+    State machine:
+      HEALTHY  → ping every 4 min, log at DEBUG
+      WAKING   → ping every 30s with 60s timeout, log at WARNING
+                 (happens when Space cold-starts or Railway redeploys)
+      On success after WAKING → back to HEALTHY, log INFO
+
+    Why not just always use a 60s ping?
+    A 60s blocking call every 4 minutes means the thread sleeps fine.
+    But when the Space IS healthy, a 60s timeout is wasteful — we
+    want /health responses in <1s. The state machine uses an appropriate
+    timeout for each state.
     """
-    time.sleep(10)  # let Django finish booting first
+    time.sleep(15)  # let gunicorn fully boot before first ping
+
+    space_is_healthy = False  # start in waking state to get first ping ASAP
+
     while True:
+        timeout   = PING_TIMEOUT if not space_is_healthy else 10
+        interval  = PING_INTERVAL_NORMAL_S if space_is_healthy else PING_INTERVAL_WAKEUP_S
+
         try:
-            r = requests.get(f"{HF_SPACE_URL}/health", timeout=10)
+            r = requests.get(f"{HF_SPACE_URL}/health", timeout=timeout)
             if r.status_code == 200:
-                logger.debug("HF ping OK: %s", r.json())
+                if not space_is_healthy:
+                    logger.info("HF Space is UP: %s", r.json())
+                    space_is_healthy = True
+                else:
+                    logger.debug("HF ping OK")
             else:
-                logger.warning("HF ping HTTP %s", r.status_code)
+                logger.warning("HF ping HTTP %s — switching to wake-up mode", r.status_code)
+                space_is_healthy = False
+        except requests.exceptions.Timeout:
+            logger.warning(
+                "HF ping timed out (%ds) — Space may be cold-starting. "
+                "Will retry in %ds.",
+                timeout, PING_INTERVAL_WAKEUP_S
+            )
+            space_is_healthy = False
         except Exception as e:
-            logger.warning("HF ping failed (Space waking?): %s", e)
-        time.sleep(PING_INTERVAL_S)
+            logger.warning("HF ping error: %s — retrying in %ds", e, PING_INTERVAL_WAKEUP_S)
+            space_is_healthy = False
+
+        time.sleep(interval)
 
 
 def start_hf_keepalive():
-    """Call once from AppConfig.ready() to start the keep-alive daemon."""
+    """Start the keep-alive daemon. Called once from apps.py."""
     t = threading.Thread(target=_hf_ping_loop, daemon=True, name="hf-keepalive")
     t.start()
-    logger.info("HF keep-alive started (every %ds)", PING_INTERVAL_S)
+    logger.info(
+        "HF keep-alive started (normal: every %ds, wake-up: every %ds)",
+        PING_INTERVAL_NORMAL_S, PING_INTERVAL_WAKEUP_S
+    )
 
 
 # ── HF HTTP wrapper with one retry ───────────────────────────────────────────
 def _hf_post(endpoint: str, files: dict) -> dict | None:
     """
     POST to HF Space with one retry on timeout.
-    If the Space is cold-starting, first request times out, retry succeeds.
+    First attempt: HF_TIMEOUT=30s.
+    If it times out (Space still waking from outside keep-alive window),
+    wait 3s and try once more with 45s timeout.
     """
     url = f"{HF_SPACE_URL}/{endpoint.lstrip('/')}"
-    for attempt in range(2):
+    timeouts = [30, 45]  # attempt 0, attempt 1
+
+    for attempt, timeout in enumerate(timeouts):
         try:
-            resp = requests.post(url, files=files, timeout=HF_TIMEOUT)
+            resp = requests.post(url, files=files, timeout=timeout)
             if resp.status_code == 200:
                 return resp.json()
-            logger.error("HF %s HTTP %s", endpoint, resp.status_code)
+            logger.error("HF %s HTTP %s: %s", endpoint, resp.status_code, resp.text[:200])
             return None
         except requests.exceptions.Timeout:
-            if attempt == 0:
-                logger.warning("HF %s timeout — retrying in 3s…", endpoint)
+            if attempt < len(timeouts) - 1:
+                logger.warning("HF %s timeout (attempt %d) — retrying in 3s…", endpoint, attempt + 1)
                 time.sleep(3)
             else:
-                logger.error("HF %s timed out on retry", endpoint)
+                logger.error("HF %s timed out on all %d attempts", endpoint, len(timeouts))
                 return None
         except Exception as e:
             logger.error("HF %s error: %s", endpoint, e)
@@ -183,11 +250,11 @@ def check_duplicate_face(embedding: np.ndarray):
         stored = user.get_embeddings()
         if not stored:
             continue
-        centroid_sim = float(np.dot(emb, _get_user_centroid(stored)))
-        arr   = np.array(stored, dtype=np.float32)
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        arr   = arr / (norms + 1e-9)
-        max_individual = float((arr @ emb).max())
+        centroid_sim     = float(np.dot(emb, _get_user_centroid(stored)))
+        arr              = np.array(stored, dtype=np.float32)
+        norms            = np.linalg.norm(arr, axis=1, keepdims=True)
+        arr              = arr / (norms + 1e-9)
+        max_individual   = float((arr @ emb).max())
         sim = max(centroid_sim, max_individual)
         if sim > best_score:
             best_score, best_user = sim, user
@@ -206,14 +273,17 @@ def mark_attendance(user, event_type: str, confidence: float):
     if last and (now - last.timestamp).total_seconds() < cooldown:
         return False, 'cooldown', 0
 
-    AttendanceLog.objects.create(user=user, event_type=event_type, confidence=round(confidence, 4))
+    AttendanceLog.objects.create(
+        user=user, event_type=event_type, confidence=round(confidence, 4)
+    )
     entry_count = 0
 
     if event_type == 'entry':
         AttendanceSession.objects.create(user=user, entry_time=now, date=today)
         user.is_present = True
         entry_count = AttendanceLog.objects.filter(
-            user=user, event_type='entry', timestamp__date=today).count()
+            user=user, event_type='entry', timestamp__date=today
+        ).count()
     else:
         sess = (AttendanceSession.objects
                 .filter(user=user, exit_time=None, date=today)
