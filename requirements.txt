@@ -1,0 +1,15 @@
+# ── Django stack ──────────────────────────────────────────────────────────────
+Django==5.2.12
+djangorestframework==3.17.0
+django-cors-headers==4.9.0
+whitenoise==6.7.0
+gunicorn==22.0.0
+
+# ── Lightweight deps (no InsightFace on Railway anymore!) ─────────────────────
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+requests==2.32.3
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+Pillow==10.4.0
+python-dotenv==1.0.1
